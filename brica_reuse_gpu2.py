@@ -1,9 +1,15 @@
+import argparse
 import numpy as np
-from chainer import Variable, FunctionSet, optimizers
+from chainer import Variable, FunctionSet, optimizers, cuda
 import chainer.functions  as F
 import data
 
 import brica1
+
+'''
+referebce
+https://github.com/wbap/V1/blob/master/python/examples/chainer_sda.py
+'''
 
 class SLP(FunctionSet):
     def __init__(self, n_input, n_output):
@@ -46,56 +52,135 @@ class Autoencoder(FunctionSet):
         return h.data
 
 class SLPComponent(brica1.Component):
-    def __init__(self, n_input, n_output):
+    def __init__(self, n_input, n_output, use_gpu=False):
         super(SLPComponent, self).__init__()
         self.model = SLP(n_input, n_output)
         self.optimizer = optimizers.Adam()
-        self.optimizer.setup(self.model.collect_parameters())
-
+        
         self.make_in_port("input", n_input)
         self.make_in_port("target", 1)
         self.make_out_port("output", n_output)
         self.make_out_port("loss", 1)
         self.make_out_port("accuracy", 1)
+        
+        self.use_gpu = use_gpu
+        
+        if self.use_gpu:
+            self.model.to_gpu()
+
+        self.optimizer.setup(self.model.collect_parameters())
+
 
     def fire(self):
         x_data = self.inputs["input"].astype(np.float32)
         t_data = self.inputs["target"].astype(np.int32)
+        
+        if self.use_gpu:
+            x_data = cuda.to_gpu(x_data)
+            y_data = cuda.to_gpu(y_data)
 
         self.optimizer.zero_grads()
         loss, accuracy = self.model.forward(x_data, t_data)
         loss.backward()
         self.optimizer.update()
-        self.results["loss"] = loss.data
-        self.results["accuracy"] = accuracy.data
 
         y_data = self.model.predict(x_data)
-        self.results["output"] = y_data
+        
+        self.results["loss"] = cuda.to_cpu(loss.data)
+        self.results["accuracy"] = cuda.to_cpu(accuracy.data)
+        self.results["output"] = cuda.to_cpu(y_data)
 
 class AutoencoderComponent(brica1.Component):
-    def __init__(self, n_input, n_output):
+    def __init__(self, n_input, n_output, use_gpu=False):
         super(AutoencoderComponent, self).__init__()
         self.model = Autoencoder(n_input, n_output)
         self.optimizer = optimizers.Adam()
-        self.optimizer.setup(self.model.collect_parameters())
-
+        
         self.make_in_port("input", n_input)
         self.make_out_port("output", n_output)
         self.make_out_port("loss", 1)
-
+        
+        self.use_gpu = use_gpu
+        
+        if self.use_gpu:
+            self.model.to_gpu()
+        
+        self.optimizer.setup(self.model.collect_parameters())
+        
     def fire(self):
         x_data = self.inputs["input"].astype(np.float32)
 
+        if self.use_gpu:
+            self.model.to_gpu()
+        
         self.optimizer.zero_grads()
         loss = self.model.forward(x_data)
         loss.backward()
         self.optimizer.update()
-        self.results["loss"] = loss.data
 
         y_data = self.model.encode(x_data)
-        self.results["output"] = y_data
+        
+        self.results["loss"] = cuda.to_cpu(loss.data)
+        self.results["output"] = cuda.to_cpu(y_data)
+
+
+class MySetupper:
+    def connection_setup(self, autoencoder1, autoencoder2, autoencoder3, slp, stacked_autoencoder):
+        self.autoencoder1 = autoencoder1
+        self.autoencoder2 = autoencoder2
+        self.autoencoder3 = autoencoder3
+        self.slp = slp
+        self.stacked_autoencoder = stacked_autoencoder
+        
+        brica1.connect((self.autoencoder1, "output"), (self.autoencoder2, "input"))
+        brica1.connect((self.autoencoder2, "output"), (self.autoencoder3, "input"))
+        brica1.connect((self.autoencoder3, "output"), (self.slp, "input"))
+
+        self.stacked_autoencoder.add_component("autoencoder1", self.autoencoder1, 1)
+        self.stacked_autoencoder.add_component("autoencoder2", self.autoencoder2, 2)
+        self.stacked_autoencoder.add_component("autoencoder3", self.autoencoder3, 3)
+        self.stacked_autoencoder.add_component("slp", self.slp, 4)
+
+        self.stacked_autoencoder.make_in_port("input", 28**2)
+        self.stacked_autoencoder.make_in_port("target", 1)
+        self.stacked_autoencoder.make_out_port("output", 1000)
+        self.stacked_autoencoder.make_out_port("loss1", 1)
+        self.stacked_autoencoder.make_out_port("loss2", 1)
+        self.stacked_autoencoder.make_out_port("loss3", 1)
+        self.stacked_autoencoder.make_out_port("loss4", 1)
+        self.stacked_autoencoder.make_out_port("accuracy", 1)
+
+        brica1.alias_in_port((self.stacked_autoencoder, "input"), (self.autoencoder1, "input"))
+        brica1.alias_out_port((self.stacked_autoencoder, "output"), (self.slp, "output"))
+        brica1.alias_out_port((self.stacked_autoencoder, "loss1"), (self.autoencoder1, "loss"))
+        brica1.alias_out_port((self.stacked_autoencoder, "loss2"), (self.autoencoder2, "loss"))
+        brica1.alias_out_port((self.stacked_autoencoder, "loss3"), (self.autoencoder3, "loss"))
+        brica1.alias_out_port((self.stacked_autoencoder, "loss4"), (self.slp, "loss"))
+        brica1.alias_out_port((self.stacked_autoencoder, "accuracy"), (self.slp, "accuracy"))
+        brica1.alias_in_port((self.stacked_autoencoder, "target"), (self.slp, "target"))
+    
+    def scheduler_setup(self, scheduler, agent, module):
+        self.scheduler = scheduler
+        self.agent = agent
+        self.module = module
+        
+        self.module.add_component("stacked_autoencoder", self.stacked_autoencoder)
+        self.agent.add_submodule("module", self.module)
+        
+        
+        
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Chainer-BriCa integration")
+    parser.add_argument("--gpu", "-g", default=-1, type=int, help="GPU ID")
+    
+    args = parser.parse_args()
+    
+    use_gpu=False
+    if args.gpu >= 0:
+        use_gpu = True
+        cuda.get_device(args.gpu).use()
+    
     batchsize = 100
     n_epoch = 1
 
@@ -109,44 +194,20 @@ if __name__ == "__main__":
     y_train, y_test = np.split(mnist['target'], [N_train])
     N_test = y_test.size
 
-    autoencoder1 = AutoencoderComponent(28**2, 1000)
-    autoencoder2 = AutoencoderComponent(1000, 1000)
-    autoencoder3 = AutoencoderComponent(1000, 1000)
+    #setup
+    autoencoder1 = AutoencoderComponent(28**2, 1000, use_gpu=use_gpu)
+    autoencoder2 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
+    autoencoder3 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
     slp = SLPComponent(1000, 10)
-
-    brica1.connect((autoencoder1, "output"), (autoencoder2, "input"))
-    brica1.connect((autoencoder2, "output"), (autoencoder3, "input"))
-    brica1.connect((autoencoder3, "output"), (slp, "input"))
-
     stacked_autoencoder = brica1.ComponentSet()
-    stacked_autoencoder.add_component("autoencoder1", autoencoder1, 1)
-    stacked_autoencoder.add_component("autoencoder2", autoencoder2, 2)
-    stacked_autoencoder.add_component("autoencoder3", autoencoder3, 3)
-    stacked_autoencoder.add_component("slp", slp, 4)
-
-    stacked_autoencoder.make_in_port("input", 28**2)
-    stacked_autoencoder.make_in_port("target", 1)
-    stacked_autoencoder.make_out_port("output", 1000)
-    stacked_autoencoder.make_out_port("loss1", 1)
-    stacked_autoencoder.make_out_port("loss2", 1)
-    stacked_autoencoder.make_out_port("loss3", 1)
-    stacked_autoencoder.make_out_port("loss4", 1)
-    stacked_autoencoder.make_out_port("accuracy", 1)
-
-    brica1.alias_in_port((stacked_autoencoder, "input"), (autoencoder1, "input"))
-    brica1.alias_out_port((stacked_autoencoder, "output"), (slp, "output"))
-    brica1.alias_out_port((stacked_autoencoder, "loss1"), (autoencoder1, "loss"))
-    brica1.alias_out_port((stacked_autoencoder, "loss2"), (autoencoder2, "loss"))
-    brica1.alias_out_port((stacked_autoencoder, "loss3"), (autoencoder3, "loss"))
-    brica1.alias_out_port((stacked_autoencoder, "loss4"), (slp, "loss"))
-    brica1.alias_out_port((stacked_autoencoder, "accuracy"), (slp, "accuracy"))
-    brica1.alias_in_port((stacked_autoencoder, "target"), (slp, "target"))
 
     scheduler = brica1.VirtualTimeSyncScheduler()
     agent = brica1.Agent(scheduler)
     module = brica1.Module()
-    module.add_component("stacked_autoencoder", stacked_autoencoder)
-    agent.add_submodule("module", module)
+    
+    original = MySetupper()
+    original.connection_setup(autoencoder1, autoencoder2, autoencoder3, slp, stacked_autoencoder)
+    original.scheduler_setup(scheduler, agent, module)
 
     time = 0.0
 
@@ -162,16 +223,16 @@ if __name__ == "__main__":
             x_batch = x_train[perm[batchnum:batchnum+batchsize]]
             y_batch = y_train[perm[batchnum:batchnum+batchsize]]
 
-            stacked_autoencoder.get_in_port("input").buffer = x_batch
-            stacked_autoencoder.get_in_port("target").buffer = y_batch
+            original.stacked_autoencoder.get_in_port("input").buffer = x_batch
+            original.stacked_autoencoder.get_in_port("target").buffer = y_batch
 
-            time = agent.step()
+            time = original.agent.step()
 
-            loss1 = stacked_autoencoder.get_out_port("loss1").buffer
-            loss2 = stacked_autoencoder.get_out_port("loss2").buffer
-            loss3 = stacked_autoencoder.get_out_port("loss3").buffer
-            loss4 = stacked_autoencoder.get_out_port("loss4").buffer
-            accuracy = stacked_autoencoder.get_out_port("accuracy").buffer
+            loss1 = original.stacked_autoencoder.get_out_port("loss1").buffer
+            loss2 = original.stacked_autoencoder.get_out_port("loss2").buffer
+            loss3 = original.stacked_autoencoder.get_out_port("loss3").buffer
+            loss4 = original.stacked_autoencoder.get_out_port("loss4").buffer
+            accuracy = original.stacked_autoencoder.get_out_port("accuracy").buffer
 
             print "Time: {}\tLoss1: {}\tLoss2: {}\tLoss3: {}\tLoss4: {}\tAccuracy: {}".format(time, loss1, loss2, loss3, loss4, accuracy)
 
@@ -184,7 +245,7 @@ if __name__ == "__main__":
         mean_loss1 = sum_loss1 / N_train
         mean_loss2 = sum_loss2 / N_train
         mean_loss3 = sum_loss3 / N_train
-        mean_loss4 = sum_loss3 / N_train
+        mean_loss4 = sum_loss4 / N_train
         mean_accuracy = sum_accuracy / N_train
 
         print "Epoch: {}\tLoss1: {}\tLoss2: {}\tLoss3: {}\tLoss4: {}\tAccuracy: {}".format(epoch, mean_loss1, mean_loss2, mean_loss3, mean_loss4, mean_accuracy)
@@ -196,43 +257,17 @@ if __name__ == "__main__":
     #reuse except autoencoder2,3,slp
     autoencoder1.last_input_time = 0.0
     autoencoder1.last_output_time = 0.0
-    autoencoder4 = AutoencoderComponent(1000, 1000)
-    autoencoder5 = AutoencoderComponent(1000, 1000)
+    autoencoder4 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
+    autoencoder5 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
     slp2 = SLPComponent(1000, 10)
-
-    brica1.connect((autoencoder1, "output"), (autoencoder4, "input"))
-    brica1.connect((autoencoder4, "output"), (autoencoder5, "input"))
-    brica1.connect((autoencoder5, "output"), (slp2, "input"))
-
     stacked_autoencoder2 = brica1.ComponentSet()
-    stacked_autoencoder2.add_component("autoencoder1", autoencoder1, 1)
-    stacked_autoencoder2.add_component("autoencoder4", autoencoder4, 2)
-    stacked_autoencoder2.add_component("autoencoder5", autoencoder5, 3)
-    stacked_autoencoder2.add_component("slp2", slp2, 4)
-
-    stacked_autoencoder2.make_in_port("input", 28**2)
-    stacked_autoencoder2.make_in_port("target", 1)
-    stacked_autoencoder2.make_out_port("output", 1000)
-    stacked_autoencoder2.make_out_port("loss1", 1)
-    stacked_autoencoder2.make_out_port("loss2", 1)
-    stacked_autoencoder2.make_out_port("loss3", 1)
-    stacked_autoencoder2.make_out_port("loss4", 1)
-    stacked_autoencoder2.make_out_port("accuracy", 1)
-
-    brica1.alias_in_port((stacked_autoencoder2, "input"), (autoencoder1, "input"))
-    brica1.alias_out_port((stacked_autoencoder2, "output"), (slp2, "output"))
-    brica1.alias_out_port((stacked_autoencoder2, "loss1"), (autoencoder1, "loss"))
-    brica1.alias_out_port((stacked_autoencoder2, "loss2"), (autoencoder4, "loss"))
-    brica1.alias_out_port((stacked_autoencoder2, "loss3"), (autoencoder5, "loss"))
-    brica1.alias_out_port((stacked_autoencoder2, "loss4"), (slp2, "loss"))
-    brica1.alias_out_port((stacked_autoencoder2, "accuracy"), (slp2, "accuracy"))
-    brica1.alias_in_port((stacked_autoencoder2, "target"), (slp2, "target"))
-    
     scheduler = brica1.VirtualTimeSyncScheduler()
     agent2 = brica1.Agent(scheduler)
     module2 = brica1.Module()
-    module2.add_component("stacked_autoencoder2", stacked_autoencoder2)
-    agent2.add_submodule("module2", module2)
+    
+    original2 = MySetupper()
+    original2.connection_setup(autoencoder1, autoencoder4, autoencoder5, slp2, stacked_autoencoder2)
+    original2.scheduler_setup(scheduler, agent2, module2)
     
     time = 0.0
 
@@ -264,24 +299,6 @@ if __name__ == "__main__":
             accuracy = stacked_autoencoder2.get_out_port("accuracy").buffer
 
             print "Time: {}\tLoss1: {}\tLoss2: {}\tLoss3: {}\tLoss4: {}\tAccuracy: {}".format(time, loss1, loss2, loss3, loss4, accuracy)
-            
-            #logger
-            if threshold["mean_loss1"] >= loss1 and flag_loss1:
-                logger["mean_loss1"] = time
-                flag_loss1 = False
-            if threshold["mean_loss2"] >= loss2 and flag_loss2:
-                logger["mean_loss2"] = time
-                flag_loss2 = False
-            if threshold["mean_loss3"] >= loss3 and flag_loss3:
-                logger["mean_loss3"] = time
-                flag_loss3 = False
-            if threshold["mean_loss4"] >= loss4 and flag_loss4:
-                logger["mean_loss4"] = time
-                flag_loss4 = False
-            if threshold["mean_accuracy"] >= accuracy and flag_accuracy:
-                logger["mean_accuracy"] = time
-                flag_accuracy = False
-                
 
             sum_loss1 += loss1 * batchsize
             sum_loss2 += loss2 * batchsize
@@ -292,8 +309,25 @@ if __name__ == "__main__":
         mean_loss1 = sum_loss1 / N_train
         mean_loss2 = sum_loss2 / N_train
         mean_loss3 = sum_loss3 / N_train
-        mean_loss4 = sum_loss3 / N_train
+        mean_loss4 = sum_loss4 / N_train
         mean_accuracy = sum_accuracy / N_train
+        
+        if threshold["mean_loss1"] >= mean_loss1 and flag_loss1:
+            logger["mean_loss1"] = epoch
+            flag_loss1 = False
+        if threshold["mean_loss2"] >= mean_loss2 and flag_loss2:
+            logger["mean_loss2"] = epoch
+            flag_loss2 = False
+        if threshold["mean_loss3"] >= mean_loss3 and flag_loss3:
+            logger["mean_loss3"] = epoch
+            flag_loss3 = False
+        if threshold["mean_loss4"] >= mean_loss4 and flag_loss4:
+            logger["mean_loss4"] = epoch
+            flag_loss4 = False
+        if threshold["mean_accuracy"] >= accuracy and flag_accuracy:
+            logger["mean_accuracy"] = time
+            flag_accuracy = False
 
         print "Epoch: {}\tLoss1: {}\tLoss2: {}\tLoss3: {}\tLoss4: {}\tAccuracy: {}".format(epoch, mean_loss1, mean_loss2, mean_loss3, mean_loss4, mean_accuracy)
-        print "result:" + str(logger)
+        
+    print "result:" + str(logger)

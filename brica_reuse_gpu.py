@@ -1,9 +1,15 @@
+import argparse
 import numpy as np
-from chainer import Variable, FunctionSet, optimizers
+from chainer import Variable, FunctionSet, optimizers, cuda
 import chainer.functions  as F
 import data
 
 import brica1
+
+'''
+referebce
+https://github.com/wbap/V1/blob/master/python/examples/chainer_sda.py
+'''
 
 class SLP(FunctionSet):
     def __init__(self, n_input, n_output):
@@ -46,56 +52,88 @@ class Autoencoder(FunctionSet):
         return h.data
 
 class SLPComponent(brica1.Component):
-    def __init__(self, n_input, n_output):
+    def __init__(self, n_input, n_output, use_gpu=False):
         super(SLPComponent, self).__init__()
         self.model = SLP(n_input, n_output)
         self.optimizer = optimizers.Adam()
-        self.optimizer.setup(self.model.collect_parameters())
-
+        
         self.make_in_port("input", n_input)
         self.make_in_port("target", 1)
         self.make_out_port("output", n_output)
         self.make_out_port("loss", 1)
         self.make_out_port("accuracy", 1)
+        
+        self.use_gpu = use_gpu
+        
+        if self.use_gpu:
+            self.model.to_gpu()
+
+        self.optimizer.setup(self.model.collect_parameters())
+
 
     def fire(self):
         x_data = self.inputs["input"].astype(np.float32)
         t_data = self.inputs["target"].astype(np.int32)
+        
+        if self.use_gpu:
+            x_data = cuda.to_gpu(x_data)
+            y_data = cuda.to_gpu(y_data)
 
         self.optimizer.zero_grads()
         loss, accuracy = self.model.forward(x_data, t_data)
         loss.backward()
         self.optimizer.update()
-        self.results["loss"] = loss.data
-        self.results["accuracy"] = accuracy.data
 
         y_data = self.model.predict(x_data)
-        self.results["output"] = y_data
+        
+        self.results["loss"] = cuda.to_cpu(loss.data)
+        self.results["accuracy"] = cuda.to_cpu(accuracy.data)
+        self.results["output"] = cuda.to_cpu(y_data)
 
 class AutoencoderComponent(brica1.Component):
-    def __init__(self, n_input, n_output):
+    def __init__(self, n_input, n_output, use_gpu=False):
         super(AutoencoderComponent, self).__init__()
         self.model = Autoencoder(n_input, n_output)
         self.optimizer = optimizers.Adam()
-        self.optimizer.setup(self.model.collect_parameters())
-
+        
         self.make_in_port("input", n_input)
         self.make_out_port("output", n_output)
         self.make_out_port("loss", 1)
-
+        
+        self.use_gpu = use_gpu
+        
+        if self.use_gpu:
+            self.model.to_gpu()
+        
+        self.optimizer.setup(self.model.collect_parameters())
+        
     def fire(self):
         x_data = self.inputs["input"].astype(np.float32)
 
+        if self.use_gpu:
+            self.model.to_gpu()
+        
         self.optimizer.zero_grads()
         loss = self.model.forward(x_data)
         loss.backward()
         self.optimizer.update()
-        self.results["loss"] = loss.data
 
         y_data = self.model.encode(x_data)
-        self.results["output"] = y_data
+        
+        self.results["loss"] = cuda.to_cpu(loss.data)
+        self.results["output"] = cuda.to_cpu(y_data)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Chainer-BriCa integration")
+    parser.add_argument("--gpu", "-g", default=-1, type=int, help="GPU ID")
+    
+    args = parser.parse_args()
+    
+    use_gpu=False
+    if args.gpu >= 0:
+        use_gpu = True
+        cuda.get_device(args.gpu).use()
+    
     batchsize = 100
     n_epoch = 1
 
@@ -109,9 +147,9 @@ if __name__ == "__main__":
     y_train, y_test = np.split(mnist['target'], [N_train])
     N_test = y_test.size
 
-    autoencoder1 = AutoencoderComponent(28**2, 1000)
-    autoencoder2 = AutoencoderComponent(1000, 1000)
-    autoencoder3 = AutoencoderComponent(1000, 1000)
+    autoencoder1 = AutoencoderComponent(28**2, 1000, use_gpu=use_gpu)
+    autoencoder2 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
+    autoencoder3 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
     slp = SLPComponent(1000, 10)
 
     brica1.connect((autoencoder1, "output"), (autoencoder2, "input"))
@@ -184,7 +222,7 @@ if __name__ == "__main__":
         mean_loss1 = sum_loss1 / N_train
         mean_loss2 = sum_loss2 / N_train
         mean_loss3 = sum_loss3 / N_train
-        mean_loss4 = sum_loss3 / N_train
+        mean_loss4 = sum_loss4 / N_train
         mean_accuracy = sum_accuracy / N_train
 
         print "Epoch: {}\tLoss1: {}\tLoss2: {}\tLoss3: {}\tLoss4: {}\tAccuracy: {}".format(epoch, mean_loss1, mean_loss2, mean_loss3, mean_loss4, mean_accuracy)
@@ -196,8 +234,8 @@ if __name__ == "__main__":
     #reuse except autoencoder2,3,slp
     autoencoder1.last_input_time = 0.0
     autoencoder1.last_output_time = 0.0
-    autoencoder4 = AutoencoderComponent(1000, 1000)
-    autoencoder5 = AutoencoderComponent(1000, 1000)
+    autoencoder4 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
+    autoencoder5 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
     slp2 = SLPComponent(1000, 10)
 
     brica1.connect((autoencoder1, "output"), (autoencoder4, "input"))
@@ -264,24 +302,6 @@ if __name__ == "__main__":
             accuracy = stacked_autoencoder2.get_out_port("accuracy").buffer
 
             print "Time: {}\tLoss1: {}\tLoss2: {}\tLoss3: {}\tLoss4: {}\tAccuracy: {}".format(time, loss1, loss2, loss3, loss4, accuracy)
-            
-            #logger
-            if threshold["mean_loss1"] >= loss1 and flag_loss1:
-                logger["mean_loss1"] = time
-                flag_loss1 = False
-            if threshold["mean_loss2"] >= loss2 and flag_loss2:
-                logger["mean_loss2"] = time
-                flag_loss2 = False
-            if threshold["mean_loss3"] >= loss3 and flag_loss3:
-                logger["mean_loss3"] = time
-                flag_loss3 = False
-            if threshold["mean_loss4"] >= loss4 and flag_loss4:
-                logger["mean_loss4"] = time
-                flag_loss4 = False
-            if threshold["mean_accuracy"] >= accuracy and flag_accuracy:
-                logger["mean_accuracy"] = time
-                flag_accuracy = False
-                
 
             sum_loss1 += loss1 * batchsize
             sum_loss2 += loss2 * batchsize
@@ -292,8 +312,25 @@ if __name__ == "__main__":
         mean_loss1 = sum_loss1 / N_train
         mean_loss2 = sum_loss2 / N_train
         mean_loss3 = sum_loss3 / N_train
-        mean_loss4 = sum_loss3 / N_train
+        mean_loss4 = sum_loss4 / N_train
         mean_accuracy = sum_accuracy / N_train
+        
+        if threshold["mean_loss1"] >= mean_loss1 and flag_loss1:
+            logger["mean_loss1"] = epoch
+            flag_loss1 = False
+        if threshold["mean_loss2"] >= mean_loss2 and flag_loss2:
+            logger["mean_loss2"] = epoch
+            flag_loss2 = False
+        if threshold["mean_loss3"] >= mean_loss3 and flag_loss3:
+            logger["mean_loss3"] = epoch
+            flag_loss3 = False
+        if threshold["mean_loss4"] >= mean_loss4 and flag_loss4:
+            logger["mean_loss4"] = epoch
+            flag_loss4 = False
+        if threshold["mean_accuracy"] >= accuracy and flag_accuracy:
+            logger["mean_accuracy"] = time
+            flag_accuracy = False
 
         print "Epoch: {}\tLoss1: {}\tLoss2: {}\tLoss3: {}\tLoss4: {}\tAccuracy: {}".format(epoch, mean_loss1, mean_loss2, mean_loss3, mean_loss4, mean_accuracy)
-        print "result:" + str(logger)
+        
+    print "result:" + str(logger)
