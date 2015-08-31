@@ -192,7 +192,10 @@ if __name__ == "__main__":
     threshold = {"mean_loss1" : mean_loss1, "mean_loss2" : mean_loss2, "mean_loss3" : mean_loss3, "mean_loss4" : mean_loss4, "mean_accuracy" : mean_accuracy}
     logger = {"mean_loss1" : 0.0, "mean_loss2" : 0.0, "mean_loss3" : 0.0, "mean_loss4" : 0.0, "mean_accuracy" : 0.0}
     
+    
     #reuse except autoencoder2,3,slp
+    autoencoder1.last_input_time = 0.0
+    autoencoder1.last_output_time = 0.0
     autoencoder4 = AutoencoderComponent(1000, 1000)
     autoencoder5 = AutoencoderComponent(1000, 1000)
     slp2 = SLPComponent(1000, 10)
@@ -224,6 +227,14 @@ if __name__ == "__main__":
     brica1.alias_out_port((stacked_autoencoder2, "loss4"), (slp2, "loss"))
     brica1.alias_out_port((stacked_autoencoder2, "accuracy"), (slp2, "accuracy"))
     brica1.alias_in_port((stacked_autoencoder2, "target"), (slp2, "target"))
+    
+    scheduler = brica1.VirtualTimeSyncScheduler()
+    agent2 = brica1.Agent(scheduler)
+    module2 = brica1.Module()
+    module2.add_component("stacked_autoencoder2", stacked_autoencoder2)
+    agent2.add_submodule("module2", module2)
+    
+    time = 0.0
 
     for epoch in xrange(n_epoch):
         perm = np.random.permutation(N_train)
@@ -244,10 +255,7 @@ if __name__ == "__main__":
 
             stacked_autoencoder2.get_in_port("input").buffer = x_batch
             stacked_autoencoder2.get_in_port("target").buffer = y_batch
-            try:
-                time = agent.step()
-            except:
-                pass
+            time = agent2.step()
 
             loss1 = stacked_autoencoder2.get_out_port("loss1").buffer
             loss2 = stacked_autoencoder2.get_out_port("loss2").buffer
