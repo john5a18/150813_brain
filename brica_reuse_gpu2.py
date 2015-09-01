@@ -1,3 +1,4 @@
+#coding: utf-8
 import argparse
 import numpy as np
 from chainer import Variable, FunctionSet, optimizers, cuda
@@ -7,7 +8,7 @@ import data
 import brica1
 
 '''
-referebce
+reference
 https://github.com/wbap/V1/blob/master/python/examples/chainer_sda.py
 '''
 
@@ -68,7 +69,8 @@ class SLPComponent(brica1.Component):
         if self.use_gpu:
             self.model.to_gpu()
 
-        self.optimizer.setup(self.model.collect_parameters())
+        self.optimizer.setup(self.model)
+        # self.optimizer.setup(self.model.collect_parameters())
 
 
     def fire(self):
@@ -77,7 +79,7 @@ class SLPComponent(brica1.Component):
         
         if self.use_gpu:
             x_data = cuda.to_gpu(x_data)
-            y_data = cuda.to_gpu(y_data)
+            t_data = cuda.to_gpu(t_data)
 
         self.optimizer.zero_grads()
         loss, accuracy = self.model.forward(x_data, t_data)
@@ -105,13 +107,14 @@ class AutoencoderComponent(brica1.Component):
         if self.use_gpu:
             self.model.to_gpu()
         
-        self.optimizer.setup(self.model.collect_parameters())
+        self.optimizer.setup(self.model)
+        # self.optimizer.setup(self.model.collect_parameters())
         
     def fire(self):
         x_data = self.inputs["input"].astype(np.float32)
 
         if self.use_gpu:
-            self.model.to_gpu()
+            x_data = cuda.to_gpu(x_data)
         
         self.optimizer.zero_grads()
         loss = self.model.forward(x_data)
@@ -125,13 +128,19 @@ class AutoencoderComponent(brica1.Component):
 
 
 class MySetupper:
-    def connection_setup(self, autoencoder1, autoencoder2, autoencoder3, slp, stacked_autoencoder):
+    def __init__(self, autoencoder1, autoencoder2, autoencoder3, slp):
         self.autoencoder1 = autoencoder1
         self.autoencoder2 = autoencoder2
         self.autoencoder3 = autoencoder3
         self.slp = slp
-        self.stacked_autoencoder = stacked_autoencoder
+        self.stacked_autoencoder = brica1.ComponentSet()
+
+        self.scheduler = brica1.VirtualTimeSyncScheduler()
+        self.agent = brica1.Agent(self.scheduler)
+        self.module = brica1.Module()
         
+        
+    def connection_setup(self):
         brica1.connect((self.autoencoder1, "output"), (self.autoencoder2, "input"))
         brica1.connect((self.autoencoder2, "output"), (self.autoencoder3, "input"))
         brica1.connect((self.autoencoder3, "output"), (self.slp, "input"))
@@ -158,14 +167,88 @@ class MySetupper:
         brica1.alias_out_port((self.stacked_autoencoder, "loss4"), (self.slp, "loss"))
         brica1.alias_out_port((self.stacked_autoencoder, "accuracy"), (self.slp, "accuracy"))
         brica1.alias_in_port((self.stacked_autoencoder, "target"), (self.slp, "target"))
+        return True
     
-    def scheduler_setup(self, scheduler, agent, module):
-        self.scheduler = scheduler
-        self.agent = agent
-        self.module = module
-        
+    def scheduler_setup(self):
         self.module.add_component("stacked_autoencoder", self.stacked_autoencoder)
         self.agent.add_submodule("module", self.module)
+        return True
+        
+    def setup(self):
+        self.connection_setup()
+        self.scheduler_setup()
+        return True
+        
+    def run(self, n_epoch, N_train, batchsize, x_train, y_train, threshold=None):
+        if threshold:
+            self.logger = {"mean_loss1" : 0.0, "mean_loss2" : 0.0, "mean_loss3" : 0.0, "mean_loss4" : 0.0, "mean_accuracy" : 0.0}
+            self.flag_loss1 = True
+            self.flag_loss2 = True
+            self.flag_loss3 = True
+            self.flag_loss4 = True
+            self.flag_accuracy = True
+
+        f = open("log.txt", "a")
+        for epoch in xrange(n_epoch):
+            perm = np.random.permutation(N_train)
+            self.sum_loss1 = 0
+            self.sum_loss2 = 0
+            self.sum_loss3 = 0
+            self.sum_loss4 = 0
+            self.sum_accuracy = 0
+
+            for batchnum in xrange(0, N_train, batchsize):
+                x_batch = x_train[perm[batchnum:batchnum+batchsize]]
+                y_batch = y_train[perm[batchnum:batchnum+batchsize]]
+
+                self.stacked_autoencoder.get_in_port("input").buffer = x_batch
+                self.stacked_autoencoder.get_in_port("target").buffer = y_batch
+
+                time = self.agent.step()
+
+                self.loss1 = self.stacked_autoencoder.get_out_port("loss1").buffer
+                self.loss2 = self.stacked_autoencoder.get_out_port("loss2").buffer
+                self.loss3 = self.stacked_autoencoder.get_out_port("loss3").buffer
+                self.loss4 = self.stacked_autoencoder.get_out_port("loss4").buffer
+                self.accuracy = self.stacked_autoencoder.get_out_port("accuracy").buffer
+                
+                # log = "Time: {}\tLoss1: {}\tLoss2: {}\tLoss3: {}\tLoss4: {}\tAccuracy: {}\n".format(time, self.loss1, self.loss2, self.loss3, self.loss4, self.accuracy)
+#                 print log
+#                 f.write(log)
+                
+                self.sum_loss1 += self.loss1 * batchsize
+                self.sum_loss2 += self.loss2 * batchsize
+                self.sum_loss3 += self.loss3 * batchsize
+                self.sum_loss4 += self.loss4 * batchsize
+                self.sum_accuracy += self.accuracy * batchsize
+
+            self.mean_loss1 = self.sum_loss1 / N_train
+            self.mean_loss2 = self.sum_loss2 / N_train
+            self.mean_loss3 = self.sum_loss3 / N_train
+            self.mean_loss4 = self.sum_loss4 / N_train
+            self.mean_accuracy = self.sum_accuracy / N_train
+            
+            if threshold:
+                if threshold["mean_loss1"] >= self.loss1 and self.flag_loss1:
+                    self.logger["mean_loss1"] = epoch
+                    self.flag_loss1 = False
+                if threshold["mean_loss2"] >= self.loss2 and self.flag_loss2:
+                    self.logger["mean_loss2"] = epoch
+                    self.flag_loss2 = False
+                if threshold["mean_loss3"] >= self.loss3 and self.flag_loss3:
+                    self.logger["mean_loss3"] = epoch
+                    self.flag_loss3 = False
+                if threshold["mean_loss4"] >= self.loss4 and self.flag_loss4:
+                    self.logger["mean_loss4"] = epoch
+                    self.flag_loss4 = False
+                if threshold["mean_accuracy"] <= self.accuracy and self.flag_accuracy:
+                    self.logger["mean_accuracy"] = epoch
+                    self.flag_accuracy = False
+
+            log = "Epoch: {}\tLoss1: {}\tLoss2: {}\tLoss3: {}\tLoss4: {}\tAccuracy: {}\n".format(epoch, self.mean_loss1, self.mean_loss2, self.mean_loss3, self.mean_loss4, self.mean_accuracy)
+            f.write(log)
+            print log
+        f.close()
         
         
         
@@ -182,7 +265,7 @@ if __name__ == "__main__":
         cuda.get_device(args.gpu).use()
     
     batchsize = 100
-    n_epoch = 1
+    n_epoch = 20
 
     mnist = data.load_mnist_data()
     mnist['data'] = mnist['data'].astype(np.float32)
@@ -199,135 +282,102 @@ if __name__ == "__main__":
     autoencoder2 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
     autoencoder3 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
     slp = SLPComponent(1000, 10)
-    stacked_autoencoder = brica1.ComponentSet()
-
-    scheduler = brica1.VirtualTimeSyncScheduler()
-    agent = brica1.Agent(scheduler)
-    module = brica1.Module()
     
-    original = MySetupper()
-    original.connection_setup(autoencoder1, autoencoder2, autoencoder3, slp, stacked_autoencoder)
-    original.scheduler_setup(scheduler, agent, module)
-
+    #setup
+    original = MySetupper(autoencoder1, autoencoder2, autoencoder3, slp)
+    original.setup()
+    
     time = 0.0
-
-    for epoch in xrange(n_epoch):
-        perm = np.random.permutation(N_train)
-        sum_loss1 = 0
-        sum_loss2 = 0
-        sum_loss3 = 0
-        sum_loss4 = 0
-        sum_accuracy = 0
-
-        for batchnum in xrange(0, N_train, batchsize):
-            x_batch = x_train[perm[batchnum:batchnum+batchsize]]
-            y_batch = y_train[perm[batchnum:batchnum+batchsize]]
-
-            original.stacked_autoencoder.get_in_port("input").buffer = x_batch
-            original.stacked_autoencoder.get_in_port("target").buffer = y_batch
-
-            time = original.agent.step()
-
-            loss1 = original.stacked_autoencoder.get_out_port("loss1").buffer
-            loss2 = original.stacked_autoencoder.get_out_port("loss2").buffer
-            loss3 = original.stacked_autoencoder.get_out_port("loss3").buffer
-            loss4 = original.stacked_autoencoder.get_out_port("loss4").buffer
-            accuracy = original.stacked_autoencoder.get_out_port("accuracy").buffer
-
-            print "Time: {}\tLoss1: {}\tLoss2: {}\tLoss3: {}\tLoss4: {}\tAccuracy: {}".format(time, loss1, loss2, loss3, loss4, accuracy)
-
-            sum_loss1 += loss1 * batchsize
-            sum_loss2 += loss2 * batchsize
-            sum_loss3 += loss3 * batchsize
-            sum_loss4 += loss4 * batchsize
-            sum_accuracy += accuracy * batchsize
-
-        mean_loss1 = sum_loss1 / N_train
-        mean_loss2 = sum_loss2 / N_train
-        mean_loss3 = sum_loss3 / N_train
-        mean_loss4 = sum_loss4 / N_train
-        mean_accuracy = sum_accuracy / N_train
-
-        print "Epoch: {}\tLoss1: {}\tLoss2: {}\tLoss3: {}\tLoss4: {}\tAccuracy: {}".format(epoch, mean_loss1, mean_loss2, mean_loss3, mean_loss4, mean_accuracy)
-        
-    threshold = {"mean_loss1" : mean_loss1, "mean_loss2" : mean_loss2, "mean_loss3" : mean_loss3, "mean_loss4" : mean_loss4, "mean_accuracy" : mean_accuracy}
-    logger = {"mean_loss1" : 0.0, "mean_loss2" : 0.0, "mean_loss3" : 0.0, "mean_loss4" : 0.0, "mean_accuracy" : 0.0}
     
+    original.run(n_epoch, N_train, batchsize, x_train, y_train)
+    threshold = {"mean_loss1" : original.mean_loss1, "mean_loss2" : original.mean_loss2, "mean_loss3" : original.mean_loss3, "mean_loss4" : original.mean_loss4, "mean_accuracy" : original.mean_accuracy}
+
+    f = open("log.txt", "a")
+    result = "threshold:" + str(threshold) + "\n"
+    f.write(result)
+    f.close()
+    print "threshold:" + str(threshold)
     
     #reuse except autoencoder2,3,slp
+    #reset autoencoder1
     autoencoder1.last_input_time = 0.0
     autoencoder1.last_output_time = 0.0
     autoencoder4 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
     autoencoder5 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
     slp2 = SLPComponent(1000, 10)
-    stacked_autoencoder2 = brica1.ComponentSet()
-    scheduler = brica1.VirtualTimeSyncScheduler()
-    agent2 = brica1.Agent(scheduler)
-    module2 = brica1.Module()
     
-    original2 = MySetupper()
-    original2.connection_setup(autoencoder1, autoencoder4, autoencoder5, slp2, stacked_autoencoder2)
-    original2.scheduler_setup(scheduler, agent2, module2)
+    original2 = MySetupper(autoencoder1, autoencoder4, autoencoder5, slp2)
+    original2.setup()
     
     time = 0.0
+    
+    original2.run(n_epoch, N_train, batchsize, x_train, y_train, threshold)
+    f = open("log.txt", "a")
+    result = "result:" + str(original2.logger) + "\n"
+    f.write(result)
+    f.close()
+    print "result:" + str(original2.logger)
+    
+    
+    #reuse except autoencoder1,3,slp
+    #reset autoencoder2
+    autoencoder6 = AutoencoderComponent(28**2, 1000, use_gpu=use_gpu)
+    autoencoder2.last_input_time = 0.0
+    autoencoder2.last_output_time = 0.0
+    autoencoder7 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
+    slp3 = SLPComponent(1000, 10)
+    
+    original3 = MySetupper(autoencoder6, autoencoder2, autoencoder7, slp3)
+    original3.setup()
+    
+    time = 0.0
+    
+    original3.run(n_epoch, N_train, batchsize, x_train, y_train, threshold)
+    f = open("log.txt", "a")
+    result = "result:" + str(original3.logger) + "\n"
+    f.write(result)
+    f.close()
+    print "result:" + str(original3.logger)
+    
 
-    for epoch in xrange(n_epoch):
-        perm = np.random.permutation(N_train)
-        flag_loss1 = True
-        flag_loss2 = True
-        flag_loss3 = True
-        flag_loss4 = True
-        flag_accuracy = True
-        sum_loss1 = 0
-        sum_loss2 = 0
-        sum_loss3 = 0
-        sum_loss4 = 0
-        sum_accuracy = 0
+    #reuse except autoencoder1,2,slp
+    #reset autoencoder2
+    autoencoder8 = AutoencoderComponent(28**2, 1000, use_gpu=use_gpu)
+    autoencoder9 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
+    autoencoder3.last_input_time = 0.0
+    autoencoder3.last_output_time = 0.0
+    slp4 = SLPComponent(1000, 10)
+    
+    original4 = MySetupper(autoencoder8, autoencoder9, autoencoder3, slp4)
+    original4.setup()
+    
+    time = 0.0
+    
+    original4.run(n_epoch, N_train, batchsize, x_train, y_train, threshold)
+    f = open("log.txt", "a")
+    result = "result:" + str(original4.logger) + "\n"
+    f.write(result)
+    f.close()
+    print "result:" + str(original4.logger)
+    
 
-        for batchnum in xrange(0, N_train, batchsize):
-            x_batch = x_train[perm[batchnum:batchnum+batchsize]]
-            y_batch = y_train[perm[batchnum:batchnum+batchsize]]
 
-            stacked_autoencoder2.get_in_port("input").buffer = x_batch
-            stacked_autoencoder2.get_in_port("target").buffer = y_batch
-            time = agent2.step()
-
-            loss1 = stacked_autoencoder2.get_out_port("loss1").buffer
-            loss2 = stacked_autoencoder2.get_out_port("loss2").buffer
-            loss3 = stacked_autoencoder2.get_out_port("loss3").buffer
-            loss4 = stacked_autoencoder2.get_out_port("loss4").buffer
-            accuracy = stacked_autoencoder2.get_out_port("accuracy").buffer
-
-            print "Time: {}\tLoss1: {}\tLoss2: {}\tLoss3: {}\tLoss4: {}\tAccuracy: {}".format(time, loss1, loss2, loss3, loss4, accuracy)
-
-            sum_loss1 += loss1 * batchsize
-            sum_loss2 += loss2 * batchsize
-            sum_loss3 += loss3 * batchsize
-            sum_loss4 += loss4 * batchsize
-            sum_accuracy += accuracy * batchsize
-
-        mean_loss1 = sum_loss1 / N_train
-        mean_loss2 = sum_loss2 / N_train
-        mean_loss3 = sum_loss3 / N_train
-        mean_loss4 = sum_loss4 / N_train
-        mean_accuracy = sum_accuracy / N_train
-        
-        if threshold["mean_loss1"] >= mean_loss1 and flag_loss1:
-            logger["mean_loss1"] = epoch
-            flag_loss1 = False
-        if threshold["mean_loss2"] >= mean_loss2 and flag_loss2:
-            logger["mean_loss2"] = epoch
-            flag_loss2 = False
-        if threshold["mean_loss3"] >= mean_loss3 and flag_loss3:
-            logger["mean_loss3"] = epoch
-            flag_loss3 = False
-        if threshold["mean_loss4"] >= mean_loss4 and flag_loss4:
-            logger["mean_loss4"] = epoch
-            flag_loss4 = False
-        if threshold["mean_accuracy"] >= accuracy and flag_accuracy:
-            logger["mean_accuracy"] = time
-            flag_accuracy = False
-
-        print "Epoch: {}\tLoss1: {}\tLoss2: {}\tLoss3: {}\tLoss4: {}\tAccuracy: {}".format(epoch, mean_loss1, mean_loss2, mean_loss3, mean_loss4, mean_accuracy)
-        
-    print "result:" + str(logger)
+    #reuse except autoencoder1,2,3
+    #reset autoencoder2
+    autoencoder10 = AutoencoderComponent(28**2, 1000, use_gpu=use_gpu)
+    autoencoder11 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
+    autoencoder12 = AutoencoderComponent(1000, 1000, use_gpu=use_gpu)
+    slp.last_input_time = 0.0
+    slp.last_output_time = 0.0
+    
+    original5 = MySetupper(autoencoder10, autoencoder11, autoencoder12, slp)
+    original5.setup()
+    
+    time = 0.0
+    
+    original5.run(n_epoch, N_train, batchsize, x_train, y_train, threshold)
+    f = open("log.txt", "a")
+    result = "result:" + str(original5.logger) + "\n"
+    f.write(result)
+    f.close()
+    print "result:" + str(original5.logger)
