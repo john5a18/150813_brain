@@ -361,7 +361,6 @@ if __name__ == "__main__":
     print "result:" + str(original4.logger)
     
 
-
     #reuse except autoencoder1,2,3
     #reset autoencoder2
     autoencoder10 = AutoencoderComponent(28**2, 1000, use_gpu=use_gpu)
